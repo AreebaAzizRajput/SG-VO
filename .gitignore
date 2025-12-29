@@ -1,0 +1,11 @@
+checkpoints
+*.pth
+*.mp4
+attn_weights*
+*.npy
+.idea/
+.vscode/
+__pycache__/
+vo_results*
+kitti_data
+depth_results*

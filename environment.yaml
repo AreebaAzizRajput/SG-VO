@@ -1,0 +1,27 @@
+name: orbsfm
+channels:
+  - nvidia
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.8
+  - pytorch=1.13
+  - torchvision=0.14
+  - pytorch-cuda=11.7
+  - pip
+  - pip:
+      - pytorch-lightning
+      - matplotlib
+      - opencv-python
+      - tqdm
+      - imageio
+      - path
+      - scipy
+      - configargparse
+      - kornia
+      - einops
+      - blessings
+      - progressbar2
+      - tensorboard
+      - protobuf==4.25.6
+      - scikit-image

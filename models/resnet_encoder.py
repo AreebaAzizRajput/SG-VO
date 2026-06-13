@@ -12,6 +12,16 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import torch.utils.model_zoo as model_zoo
+from torchvision.models.resnet import BasicBlock, Bottleneck
+
+# torchvision >= 0.13 removed model_urls — hardcode them here
+_RESNET_URLS = {
+    'resnet18':  'https://download.pytorch.org/models/resnet18-f37072fd.pth',
+    'resnet34':  'https://download.pytorch.org/models/resnet34-b627a593.pth',
+    'resnet50':  'https://download.pytorch.org/models/resnet50-0676ba61.pth',
+    'resnet101': 'https://download.pytorch.org/models/resnet101-63fe2227.pth',
+    'resnet152': 'https://download.pytorch.org/models/resnet152-394f9c45.pth',
+}
 
 
 class ResNetMultiImageInput(models.ResNet):
@@ -48,11 +58,11 @@ def resnet_multiimage_input(num_layers, pretrained=False, num_input_images=1, in
     """
     assert num_layers in [18, 50], "Can only run with 18 or 50 layer resnet"
     blocks = {18: [2, 2, 2, 2], 50: [3, 4, 6, 3]}[num_layers]
-    block_type = {18: models.resnet.BasicBlock, 50: models.resnet.Bottleneck}[num_layers]
+    block_type = {18: BasicBlock, 50: Bottleneck}[num_layers]
     model = ResNetMultiImageInput(block_type, blocks, num_input_images=num_input_images, input_image_channel=input_image_channel)
 
     if pretrained:
-        loaded = model_zoo.load_url(models.resnet.model_urls['resnet{}'.format(num_layers)])
+        loaded = model_zoo.load_url(_RESNET_URLS['resnet{}'.format(num_layers)])
         expand = int(num_input_images * input_image_channel / 3)
         loaded['conv1.weight'] = torch.cat(
             [loaded['conv1.weight']] * expand, 1) / num_input_images
@@ -88,7 +98,24 @@ class ResnetEncoder(nn.Module):
         if num_input_images > 1:
             self.encoder = resnet_multiimage_input(num_layers, pretrained, num_input_images, input_image_channel)
         else:
-            self.encoder = resnets[num_layers](pretrained)
+            # torchvision >= 0.13 deprecated pretrained=True; use weights= API
+            try:
+                from torchvision.models import (
+                    ResNet18_Weights, ResNet34_Weights, ResNet50_Weights,
+                    ResNet101_Weights, ResNet152_Weights
+                )
+                _weights_map = {
+                    18: ResNet18_Weights.IMAGENET1K_V1,
+                    34: ResNet34_Weights.IMAGENET1K_V1,
+                    50: ResNet50_Weights.IMAGENET1K_V1,
+                    101: ResNet101_Weights.IMAGENET1K_V1,
+                    152: ResNet152_Weights.IMAGENET1K_V1,
+                }
+                w = _weights_map[num_layers] if pretrained else None
+                self.encoder = resnets[num_layers](weights=w)
+            except ImportError:
+                # torchvision < 0.13 fallback
+                self.encoder = resnets[num_layers](pretrained=pretrained)
 
         if num_layers > 34:
             self.num_ch_enc[1:] *= 4

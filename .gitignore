@@ -1,6 +1,7 @@
 checkpoints
 *.pth
 *.mp4
+*.deb
 attn_weights*
 *.npy
 .idea/
@@ -9,3 +10,5 @@ __pycache__/
 vo_results*
 kitti_data
 depth_results*
+data/kitti_odom/sequences/*/
+data/kitti_256/

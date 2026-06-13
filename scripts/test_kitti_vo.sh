@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Dataset and output paths
-DATASET_DIR=/scratch/data/kitti/data_odometry_color/dataset/sequences/
+DATASET_DIR=/home/areeba/ICRAMaxxing/SG-VO/data/kitti_odom/sequences/
 OUTPUT_DIR=vo_results/
 
 # Pretrained pose network
-POSE_NET=checkpoints/exp_pose112_model_best.pth.tar
+POSE_NET=/home/areeba/ICRAMaxxing/SG-VO/checkpoints/exp_pose112_model_best.pth.tar
 
 # Run VO test for selected sequences
 for sequence in $(seq -w 00 10); do

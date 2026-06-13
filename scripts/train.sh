@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Dataset path
-TRAIN_SET=/scratch/data/kitti/kitti_256
+TRAIN_SET=/home/areeba/ICRAMaxxing/SG-VO/data/kitti_256
 
 # GPU
 CUDA_VISIBLE_DEVICES=0

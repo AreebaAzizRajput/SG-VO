@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from path import Path
-from imageio import imread, imsave
+from imageio.v2 import imread, imsave
 from skimage.transform import resize as imresize
 from skimage import img_as_ubyte
 

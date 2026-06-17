@@ -6,7 +6,7 @@ import concurrent.futures
 import torch
 import numpy as np
 from tqdm import tqdm
-from imageio import imread, imsave
+from imageio.v2 import imread, imsave
 from skimage.transform import resize as imresize
 from skimage import img_as_ubyte
 from path import Path

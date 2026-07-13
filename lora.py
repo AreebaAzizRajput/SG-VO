@@ -19,8 +19,11 @@ class LoRALinear(nn.Module):
             p.requires_grad_(False)
 
         in_f, out_f = original.in_features, original.out_features
-        self.lora_A = nn.Parameter(torch.empty(rank, in_f))
-        self.lora_B = nn.Parameter(torch.zeros(out_f, rank))
+        # Create adapters on the SAME device/dtype as the wrapped layer, so
+        # injection also works after the model was already moved to GPU.
+        dev, dt = original.weight.device, original.weight.dtype
+        self.lora_A = nn.Parameter(torch.empty(rank, in_f, device=dev, dtype=dt))
+        self.lora_B = nn.Parameter(torch.zeros(out_f, rank, device=dev, dtype=dt))
         self.scale  = alpha / rank
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
@@ -49,6 +52,9 @@ class LoRAConv2d(nn.Module):
         self.scale     = alpha / rank
         nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_up.weight)
+        # Match the wrapped layer's device/dtype (model may already be on GPU).
+        self.lora_down.to(original.weight.device, original.weight.dtype)
+        self.lora_up.to(original.weight.device, original.weight.dtype)
 
     def forward(self, x):
         return self.original(x) + self.scale * self.lora_up(self.lora_down(x))

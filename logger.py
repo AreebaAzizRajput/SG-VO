@@ -1,10 +1,21 @@
-from blessings import Terminal
-import progressbar
 import sys
+
+# blessings/progressbar are only needed by TermLogger (training terminal UI).
+# Import lazily so eval scripts (test_vo_online.py) can use AverageMeter
+# without these training-only packages installed.
+try:
+    from blessings import Terminal
+    import progressbar
+except ImportError:
+    Terminal = None
+    progressbar = None
 
 
 class TermLogger(object):
     def __init__(self, n_epochs, train_size, valid_size):
+        if Terminal is None or progressbar is None:
+            raise ImportError('TermLogger requires blessings and progressbar2: '
+                              'pip install blessings progressbar2')
         self.n_epochs = n_epochs
         self.train_size = train_size
         self.valid_size = valid_size

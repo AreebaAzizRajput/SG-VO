@@ -98,8 +98,9 @@ parser.add_argument('--lora-alpha', type=float, default=1.0,
 # on this frame and we skip the expensive adaptation step entirely.
 # 0.0 = always adapt (original behaviour).  Try 0.8 as a first experiment.
 parser.add_argument('--adapt-threshold', type=float, default=0.0,
-                    help='Skip adaptation when photo_loss < adapt_threshold × EMA_loss. '
-                         '0.0 = always adapt. Recommended starting value: 0.8.')
+                    help='Adapt only when photo_loss > adapt_threshold × EMA_loss '
+                         '(surprise trigger; values > 1 make sense, e.g. 1.2 = adapt '
+                         'when 20%% harder than recent average). 0.0 = always adapt.')
 
 
 def load_tensor_image(filename, args):
@@ -388,8 +389,13 @@ def main():
             else:
                 ema_loss = 0.9 * ema_loss + 0.1 * current_loss
 
-            # Skip adaptation if current frame is "easy" relative to recent average
-            if current_loss < args.adapt_threshold * ema_loss:
+            # Adapt only on SURPRISE: loss spiking above the recent moving
+            # average signals unfamiliar conditions (domain shift). On
+            # stationary in-domain footage current_loss ~= ema_loss, so the
+            # trigger stays quiet and we keep the offline weights.
+            # (The previous form skipped only on unusually EASY frames, which
+            # almost never occur — measured 0% skips, making D identical to C.)
+            if current_loss <= args.adapt_threshold * ema_loss:
                 do_adapt    = False
                 skip_count += 1
 

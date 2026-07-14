@@ -97,6 +97,9 @@ parser.add_argument('--lora-alpha', type=float, default=1.0,
 # (adapt_threshold × running_average_loss), the model is already doing well
 # on this frame and we skip the expensive adaptation step entirely.
 # 0.0 = always adapt (original behaviour).  Try 0.8 as a first experiment.
+parser.add_argument('--probe-only', action='store_true',
+                    help='Never adapt; just record the per-frame probe loss to '
+                         'probe_losses_<seq>.txt for offline trigger design.')
 parser.add_argument('--adapt-threshold', type=float, default=0.0,
                     help='Adapt only when photo_loss > adapt_threshold × EMA_loss '
                          '(surprise trigger; values > 1 make sense, e.g. 1.2 = adapt '
@@ -357,9 +360,10 @@ def main():
     # ema_loss: exponential moving average of per-frame photometric loss.
     # Updated at every frame (whether we adapt or not) to track the "normal"
     # difficulty level of the current sequence.
-    ema_loss    = -1.0
-    adapt_count = 0
-    skip_count  = 0
+    ema_loss     = -1.0
+    adapt_count  = 0
+    skip_count   = 0
+    probe_losses = []   # per-frame probe loss trace (probe-only / trigger runs)
 
     # ── Main inference loop ───────────────────────────────────────────────────
     for iter in tqdm(range(n - int(args.sequence_length) + 1)):
@@ -379,10 +383,17 @@ def main():
 
         # ── Trigger: decide whether this frame needs adaptation ───────────────
         # If --adapt-threshold is 0, do_adapt is always True (original behaviour).
+        # --probe-only records the per-frame loss WITHOUT ever adapting, so
+        # trigger designs can be simulated offline on the recorded trace.
         do_adapt = True
-        if args.adapt_threshold > 0:
+        if args.probe_only or args.adapt_threshold > 0:
             current_loss = probe_photo_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
+            probe_losses.append(current_loss)
 
+        if args.probe_only:
+            do_adapt    = False
+            skip_count += 1
+        elif args.adapt_threshold > 0:
             # Warm up EMA on the first frame, then update with decay 0.9
             if ema_loss < 0:
                 ema_loss = current_loss
@@ -461,6 +472,11 @@ def main():
     total = adapt_count + skip_count
     print(f'\nAdaptation summary: {adapt_count} adapted, {skip_count} skipped '
           f'({100 * skip_count / max(total, 1):.1f}% skipped)')
+
+    if probe_losses:
+        loss_file = Path(args.output_dir + 'probe_losses_' + args.sequence + '.txt')
+        np.savetxt(loss_file, np.asarray(probe_losses), fmt='%1.6e')
+        print(f'Probe loss trace ({len(probe_losses)} frames) -> {loss_file}')
 
     poses    = np.concatenate(poses, axis=0)
     filename = Path(args.output_dir + args.sequence + ".txt")

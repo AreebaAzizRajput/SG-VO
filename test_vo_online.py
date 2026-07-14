@@ -257,18 +257,30 @@ def probe_photo_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net) ->
     """
     disp_net.eval()
     pose_net.eval()
+
+    def _depth_scales(disp_out):
+        # DispResNet returns a list of scales in train mode but a single
+        # tensor in eval mode (models/DispResNet.py forward). Normalise to
+        # a list so we never iterate a tensor's batch dimension.
+        if not isinstance(disp_out, (list, tuple)):
+            disp_out = [disp_out]
+        return [1 / d for d in disp_out]
+
     with torch.no_grad():
         tgt_d  = tgt_img[:, :3, :, :].to(device)
         refs_d = [img[:, :3, :, :].to(device) for img in ref_imgs]
         intr   = intrinsics.to(device)
 
-        tgt_depth, ref_depths = compute_depth(disp_net, tgt_d, refs_d)
-        poses, poses_inv      = compute_pose_with_inv(pose_net, tgt_img.to(device), [img.to(device) for img in ref_imgs])
+        tgt_depth  = _depth_scales(disp_net(tgt_d))
+        ref_depths = [_depth_scales(disp_net(r)) for r in refs_d]
+        poses, poses_inv = compute_pose_with_inv(pose_net, tgt_img.to(device), [img.to(device) for img in ref_imgs])
 
+        # eval mode yields a single scale; score the loss on what's available
+        n_scales = min(args.num_scales, len(tgt_depth))
         loss_photo, _ = compute_photo_and_geometry_loss(
             tgt_d, refs_d, intr,
             tgt_depth, ref_depths, poses, poses_inv,
-            args.num_scales, args.with_ssim,
+            n_scales, args.with_ssim,
             args.with_mask, args.with_auto_mask, args.padding_mode)
 
     return loss_photo.item()

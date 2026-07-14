@@ -101,9 +101,29 @@ parser.add_argument('--probe-only', action='store_true',
                     help='Never adapt; just record the per-frame probe loss to '
                          'probe_losses_<seq>.txt for offline trigger design.')
 parser.add_argument('--adapt-threshold', type=float, default=0.0,
-                    help='Adapt only when photo_loss > adapt_threshold × EMA_loss '
-                         '(surprise trigger; values > 1 make sense, e.g. 1.2 = adapt '
-                         'when 20%% harder than recent average). 0.0 = always adapt.')
+                    help='LEGACY spike trigger (kept for ablation): adapt only when '
+                         'photo_loss > adapt_threshold × EMA_loss. Fires at the '
+                         'hardest frames, which measurably degrades accuracy. '
+                         '0.0 = disabled. Prefer --cusum-h.')
+parser.add_argument('--cusum-h', type=float, default=0.0,
+                    help='CUSUM trigger decision threshold in units of reference '
+                         'std (e.g. 16). Adapt when the CUSUM statistic S_t = '
+                         'max(0, S + (loss - mu_ref - kappa)) exceeds h*sigma_ref: '
+                         'fires only on SUSTAINED loss elevation (domain shift), '
+                         'not transient hard frames. 0.0 = disabled.')
+parser.add_argument('--cusum-kappa', type=float, default=1.0,
+                    help='CUSUM allowance in units of reference std (default 1.0).')
+parser.add_argument('--cusum-calib-frames', type=int, default=100,
+                    help='Frames used to estimate (mu_ref, sigma_ref) at sequence '
+                         'start when no explicit reference is given (no adaptation '
+                         'during calibration).')
+parser.add_argument('--cusum-ref-mean', type=float, default=None,
+                    help='Explicit reference loss mean (e.g. training-domain '
+                         'statistics). Overrides start-of-sequence calibration; '
+                         'REQUIRED for sequences that begin already domain-shifted '
+                         '(e.g. vKITTI fog).')
+parser.add_argument('--cusum-ref-std', type=float, default=None,
+                    help='Explicit reference loss std, together with --cusum-ref-mean.')
 
 
 def load_tensor_image(filename, args):
@@ -365,6 +385,12 @@ def main():
     skip_count   = 0
     probe_losses = []   # per-frame probe loss trace (probe-only / trigger runs)
 
+    # ── CUSUM trigger state ───────────────────────────────────────────────────
+    cusum_S     = 0.0
+    cusum_mu    = args.cusum_ref_mean
+    cusum_sigma = args.cusum_ref_std
+    cusum_calib = []    # losses collected during start-of-sequence calibration
+
     # ── Main inference loop ───────────────────────────────────────────────────
     for iter in tqdm(range(n - int(args.sequence_length) + 1)):
 
@@ -386,13 +412,39 @@ def main():
         # --probe-only records the per-frame loss WITHOUT ever adapting, so
         # trigger designs can be simulated offline on the recorded trace.
         do_adapt = True
-        if args.probe_only or args.adapt_threshold > 0:
+        if args.probe_only or args.adapt_threshold > 0 or args.cusum_h > 0:
             current_loss = probe_photo_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
             probe_losses.append(current_loss)
 
         if args.probe_only:
             do_adapt    = False
             skip_count += 1
+        elif args.cusum_h > 0:
+            # ── CUSUM trigger: adapt only on SUSTAINED loss elevation ──────────
+            # S accumulates evidence that the loss mean has shifted above the
+            # reference; transient hard frames (turns, glare) drain back out via
+            # the max(0, .) floor. Fires only when elevation persists = domain
+            # shift. Chosen over the spike rule after offline simulation on
+            # recorded traces (see trigger_sim.py): the spike rule fired at the
+            # hardest frames, which measurably degraded accuracy.
+            if cusum_mu is None:
+                # start-of-sequence calibration (assumes in-domain start)
+                cusum_calib.append(current_loss)
+                do_adapt    = False
+                skip_count += 1
+                if len(cusum_calib) >= args.cusum_calib_frames:
+                    arr         = np.asarray(cusum_calib)
+                    cusum_mu    = float(arr.mean())
+                    cusum_sigma = float(arr.std()) + 1e-12
+                    print(f'CUSUM calibrated: mu={cusum_mu:.4f} sigma={cusum_sigma:.4f}')
+            else:
+                cusum_S = max(0.0, cusum_S + (current_loss - cusum_mu
+                                              - args.cusum_kappa * cusum_sigma))
+                if cusum_S > args.cusum_h * cusum_sigma:
+                    cusum_S  = 0.0   # reset: adaptation happens this frame
+                else:
+                    do_adapt    = False
+                    skip_count += 1
         elif args.adapt_threshold > 0:
             # Warm up EMA on the first frame, then update with decay 0.9
             if ema_loss < 0:

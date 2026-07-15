@@ -13,7 +13,8 @@ from path import Path
 
 from models import DispResNet, PoseResNet
 from logger import AverageMeter
-from loss_functions import compute_smooth_loss, compute_photo_and_geometry_loss
+from loss_functions import compute_smooth_loss, compute_photo_and_geometry_loss, compute_ssim_loss
+from inverse_warp import inverse_warp2
 from utils import (
     tensor2array,
     compute_depth,
@@ -124,6 +125,17 @@ parser.add_argument('--cusum-ref-mean', type=float, default=None,
                          '(e.g. vKITTI fog).')
 parser.add_argument('--cusum-ref-std', type=float, default=None,
                     help='Explicit reference loss std, together with --cusum-ref-mean.')
+parser.add_argument('--probe-signal', type=str, default='photo',
+                    choices=['photo', 'ratio', 'bnstats'],
+                    help='Signal fed to the trigger/probe trace. photo: raw '
+                         'photometric loss (legacy — confounded by image '
+                         'contrast: fog LOWERS it while accuracy collapses). '
+                         'ratio: photometric loss of the predicted pose divided '
+                         'by that of the identity (zero-motion) warp — the '
+                         'contrast factor cancels, so it measures how much '
+                         'motion the pose actually explains. bnstats: mean '
+                         'BatchNorm feature-statistics distance from the '
+                         'training domain — absolute, non-photometric.')
 
 
 def load_tensor_image(filename, args):
@@ -310,6 +322,96 @@ def probe_photo_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net) ->
     return loss_photo.item()
 
 
+def probe_ratio_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net) -> float:
+    """Contrast-normalized probe: photometric error under the predicted pose
+    divided by the error of assuming zero motion (identity warp).
+
+    Raw photometric loss cannot detect weather shift: fog lowers global image
+    contrast, which lowers reconstruction error even while the pose collapses
+    (vKITTI Scene01: fog probe mean 0.83 vs clone 0.94, t_err 3x worse). The
+    zero-motion baseline drops by the same contrast factor, so their ratio
+    cancels it and measures the fraction of frame-to-frame change the pose
+    explains. In-domain values sit well below 1; values approaching 1 mean the
+    pose is no better than not moving at all.
+
+    Masks are deliberately NOT the training auto-mask: with a zero pose the
+    warped image equals the reference, which empties the auto-mask and zeroes
+    the baseline. Only the warp validity mask is applied, to both terms.
+    """
+    disp_net.eval()
+    pose_net.eval()
+
+    with torch.no_grad():
+        tgt_d  = tgt_img[:, :3, :, :].to(device)
+        refs_d = [img[:, :3, :, :].to(device) for img in ref_imgs]
+        intr   = intrinsics.to(device)
+
+        disp = disp_net(tgt_d)
+        tgt_depth = 1 / (disp[0] if isinstance(disp, (list, tuple)) else disp)
+
+        num = 0.0
+        den = 0.0
+        for ref_full, ref in zip(ref_imgs, refs_d):
+            rdisp = disp_net(ref)
+            ref_depth = 1 / (rdisp[0] if isinstance(rdisp, (list, tuple)) else rdisp)
+            pose = pose_net(tgt_img.to(device), ref_full.to(device))
+
+            ref_warped, valid_mask, _, _ = inverse_warp2(
+                ref, tgt_depth, ref_depth, pose, intr, args.padding_mode)
+
+            diff_warp   = (tgt_d - ref_warped).abs().clamp(0, 1)
+            diff_static = (tgt_d - ref).abs().clamp(0, 1)
+            if args.with_ssim:
+                diff_warp   = 0.15 * diff_warp   + 0.85 * compute_ssim_loss(tgt_d, ref_warped)
+                diff_static = 0.15 * diff_static + 0.85 * compute_ssim_loss(tgt_d, ref)
+
+            mask = valid_mask.expand_as(diff_warp)
+            norm = mask.sum().clamp(min=1)
+            num += (diff_warp * mask).sum() / norm
+            den += (diff_static * mask).sum() / norm
+
+    return (num / (den + 1e-12)).item()
+
+
+def probe_bnstats_distance(pose_net, tgt_img, ref_img) -> float:
+    """Feature-statistics probe: how far the current frames' activation
+    statistics sit from the training domain, measured at every BatchNorm layer
+    of pose_net as mean over channels of |batch mean - running mean| / sqrt(
+    running var). Absolute with respect to the training domain (no in-stream
+    calibration needed) and non-photometric, so immune to the contrast
+    confound that breaks the raw loss probe under fog.
+    """
+    dists = []
+    hooks = []
+
+    def hook(module, inputs, output):
+        x = inputs[0]
+        mu_b = x.mean(dim=(0, 2, 3))
+        d = ((mu_b - module.running_mean).abs()
+             / (module.running_var + module.eps).sqrt()).mean()
+        dists.append(d.item())
+
+    for m in pose_net.modules():
+        if isinstance(m, torch.nn.BatchNorm2d) and m.track_running_stats:
+            hooks.append(m.register_forward_hook(hook))
+
+    pose_net.eval()
+    with torch.no_grad():
+        pose_net(tgt_img.to(device), ref_img.to(device))
+
+    for h in hooks:
+        h.remove()
+    return float(np.mean(dists))
+
+
+def compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net) -> float:
+    if args.probe_signal == 'ratio':
+        return probe_ratio_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
+    if args.probe_signal == 'bnstats':
+        return probe_bnstats_distance(pose_net, tgt_img, ref_imgs[0])
+    return probe_photo_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
+
+
 def main():
     args     = parser.parse_args()
     use_lora = args.lora_rank > 0
@@ -413,7 +515,7 @@ def main():
         # trigger designs can be simulated offline on the recorded trace.
         do_adapt = True
         if args.probe_only or args.adapt_threshold > 0 or args.cusum_h > 0:
-            current_loss = probe_photo_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
+            current_loss = compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
             probe_losses.append(current_loss)
 
         if args.probe_only:

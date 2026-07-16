@@ -166,6 +166,15 @@ parser.add_argument('--recovery-margin', type=float, default=0.1,
                          'count as still helping. Without it a dead-weight '
                          'adapter that wins by numerical dust (measured: '
                          '1e-5 on every frame) blocks the reset forever.')
+parser.add_argument('--static-floor', type=float, default=0.3,
+                    help='Static-frame gate for the ratio signal: when the '
+                         'zero-motion baseline drops below this fraction of '
+                         'its running median, the vehicle is (near-)still — '
+                         'the ratio divides two near-zero losses and '
+                         'explodes (measured up to 2.2 at a vKITTI stop, 16 '
+                         'false fires). Such frames hold the trigger state '
+                         'and skip adaptation: a static frame carries no '
+                         'motion information to adapt on. 0 disables.')
 
 
 def load_tensor_image(filename, args):
@@ -423,7 +432,13 @@ def probe_ratio_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net) ->
             num += (diff_warp * mask).sum() / norm
             den += (diff_static * mask).sum() / norm
 
-    return (num / (den + 1e-12)).item()
+    # The static-frame gate quantity is den normalized by the image's own
+    # contrast: raw den scales with atmospheric transmission (fog shrinks
+    # it ~3x, which read as "static" and suppressed every fog fire in
+    # simulation), while den/contrast cancels that factor — moving frames
+    # sit at ~0.2-0.5 in every weather, standstill at ~0.02-0.07.
+    den_gate = den / (tgt_d.std() + 1e-12)
+    return (num / (den + 1e-12)).item(), den_gate.item()
 
 
 def probe_bnstats_distance(pose_net, tgt_img, ref_img) -> float:
@@ -475,12 +490,14 @@ def zero_motion_baseline(args, tgt_img, ref_imgs) -> float:
         return float(torch.stack(vals).mean())
 
 
-def compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net) -> float:
+def compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net):
+    """Returns (signal, zero_motion_den). den is None for signals that have
+    no denominator; for 'ratio' it feeds the static-frame gate."""
     if args.probe_signal == 'ratio':
         return probe_ratio_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
     if args.probe_signal == 'bnstats':
-        return probe_bnstats_distance(pose_net, tgt_img, ref_imgs[0])
-    return probe_photo_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
+        return probe_bnstats_distance(pose_net, tgt_img, ref_imgs[0]), None
+    return probe_photo_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net), None
 
 
 def main():
@@ -569,6 +586,9 @@ def main():
     recovery_count = 0       # consecutive frames the BASE model was in-band
     events         = []      # (frame, 'adapt'|'reset', signal) — saved at exit
 
+    # ── Static-frame gate state (ratio signal only) ───────────────────────────
+    den_hist = []            # recent zero-motion baselines; median = "moving" level
+
     # ── Main inference loop ───────────────────────────────────────────────────
     for iter in tqdm(range(n - int(args.sequence_length) + 1)):
 
@@ -590,11 +610,27 @@ def main():
         # --probe-only records the per-frame loss WITHOUT ever adapting, so
         # trigger designs can be simulated offline on the recorded trace.
         do_adapt = True
+        static_frame = False
         if args.probe_only or args.adapt_threshold > 0 or args.cusum_h > 0:
-            current_loss = compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
+            current_loss, zero_den = compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
             probe_losses.append(current_loss)
 
-        if args.probe_only:
+            # ── Static-frame gate: at (near-)standstill the ratio divides two
+            # near-zero losses and explodes; the frame also carries no motion
+            # information worth adapting on. Hold all trigger state.
+            if zero_den is not None and args.static_floor > 0:
+                if len(den_hist) >= 20:
+                    med = sorted(den_hist)[len(den_hist) // 2]
+                    static_frame = zero_den < args.static_floor * med
+                if not static_frame:
+                    den_hist.append(zero_den)
+                    if len(den_hist) > 100:
+                        den_hist.pop(0)
+
+        if static_frame:
+            do_adapt    = False
+            skip_count += 1
+        elif args.probe_only:
             do_adapt    = False
             skip_count += 1
         elif args.cusum_h > 0:
@@ -653,10 +689,10 @@ def main():
         # so their fluctuations cancel in the comparison. Probing the adapted
         # model alone would oscillate: adapt -> signal drops -> reset ->
         # signal spikes -> adapt ...
-        if (args.reset_on_recovery and use_lora and shifted
+        if (args.reset_on_recovery and use_lora and shifted and not static_frame
                 and args.cusum_h > 0 and cusum_mu is not None):
             set_lora_enabled(pose_net, False)
-            base_signal = compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
+            base_signal, _ = compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
             set_lora_enabled(pose_net, True)
             # current_loss is the adapted-model probe. The adapter must beat
             # the base by a significant margin to stay; ties and dust-level

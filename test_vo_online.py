@@ -71,6 +71,18 @@ parser.add_argument("--output-disp", action='store_true', help="save disparity i
 parser.add_argument("--output-depth", action='store_true', help="save depth img")
 # for partial adaptation (decoder only, original flag)
 parser.add_argument("--part", action='store_true', help="partial adaptation: train decoder layers only")
+# ── Network decomposition (which net absorbs the shift?) ─────────────────────
+# Full adaptation (B) trains disp_net AND pose_net jointly, so its fog rescue
+# does not say WHERE the correction lives. These modes adapt exactly one net
+# in full while the other is frozen (requires_grad off AND BatchNorm pinned,
+# so not even running stats move). Distinguishes "pose-side PEFT was doomed
+# regardless of capacity" from "LoRA rank/targets were too weak".
+parser.add_argument('--adapt-nets', type=str, default='both',
+                    choices=['both', 'pose', 'disp'],
+                    help='Which networks full adaptation trains. both = original '
+                         'B behaviour. pose = pose_net only (upper bound for any '
+                         'pose-side PEFT incl. LoRA). disp = disp_net only. '
+                         'Incompatible with --lora-rank > 0.')
 # for best selection
 parser.add_argument("--select-best", type=int, default=1, help="select best parameters or not")
 
@@ -224,11 +236,12 @@ def build_optimizer(args, pose_net, disp_net, use_lora=False):
         return torch.optim.Adam(params, lr=args.lr,
                                 betas=(args.momentum, args.beta),
                                 weight_decay=args.weight_decay)
-    # Original: full adaptation of both networks
-    optim_params = [
-        {'params': disp_net.parameters(), 'lr': args.lr},
-        {'params': pose_net.parameters(), 'lr': args.lr},
-    ]
+    # Original: full adaptation; --adapt-nets restricts to one network
+    optim_params = []
+    if args.adapt_nets in ('both', 'disp'):
+        optim_params.append({'params': disp_net.parameters(), 'lr': args.lr})
+    if args.adapt_nets in ('both', 'pose'):
+        optim_params.append({'params': pose_net.parameters(), 'lr': args.lr})
     return torch.optim.Adam(optim_params,
                             betas=(args.momentum, args.beta),
                             weight_decay=args.weight_decay)
@@ -270,20 +283,27 @@ def train(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net, optimizer, ep
     disp_net.train()
     pose_net.train()
 
+    # BatchNorm running stats are adapted state too: in train mode every
+    # adaptation step drifts them toward the current (e.g. fog) batch
+    # statistics. Any net that is supposed to be frozen must have its BN
+    # modules pinned to eval, or it silently adapts anyway — with LoRA this
+    # broke reset_lora's exact-recovery guarantee (+0.03 probe elevation)
+    # and the 0.083% accounting; with --adapt-nets it would contaminate the
+    # decomposition. Pin ONLY the BN modules: whole-net eval() would switch
+    # DispResNet's forward to its eval shape (single tensor, not the
+    # multi-scale list) and crash the loss (see 8576494).
     if use_lora:
-        # Confine adaptation strictly to the adapters. BatchNorm running
-        # stats are adapted state too: in train mode every adaptation step
-        # drifts them toward the current (e.g. fog) batch statistics — state
-        # that lives OUTSIDE the adapters, silently breaking reset_lora's
-        # exact-recovery guarantee (measured as a +0.03 probe elevation after
-        # reset) and the "only 0.083% of parameters adapt" accounting.
-        # Pin ONLY the BatchNorm modules: whole-net eval() would also switch
-        # DispResNet's forward to its eval shape (single tensor, not the
-        # multi-scale list) and crash the loss (see 8576494).
-        for net in (disp_net, pose_net):
-            for m in net.modules():
-                if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
-                    m.eval()
+        bn_pinned = (disp_net, pose_net)   # adapters only; both bases frozen
+    elif args.adapt_nets == 'pose':
+        bn_pinned = (disp_net,)
+    elif args.adapt_nets == 'disp':
+        bn_pinned = (pose_net,)
+    else:
+        bn_pinned = ()                     # original B: everything adapts
+    for net in bn_pinned:
+        for m in net.modules():
+            if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+                m.eval()
 
     end        = time.time()
     best_error = -1
@@ -333,8 +353,12 @@ def train(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net, optimizer, ep
                 weights_pose_best = lora_state_dict(pose_net)
                 # disp_net is fully frozen when using LoRA — its snapshot never changes
             else:
-                weights_disp_best = copy.deepcopy(disp_net.state_dict())
-                weights_pose_best = copy.deepcopy(pose_net.state_dict())
+                # A net frozen by --adapt-nets cannot change (grads off, BN
+                # pinned above) — skip its ~100 MB deepcopy.
+                if args.adapt_nets in ('both', 'disp'):
+                    weights_disp_best = copy.deepcopy(disp_net.state_dict())
+                if args.adapt_nets in ('both', 'pose'):
+                    weights_pose_best = copy.deepcopy(pose_net.state_dict())
 
         if i < epochs - 1 or epochs == 1 or args.select_best == 0:
             optimizer.zero_grad()
@@ -503,6 +527,9 @@ def compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net
 def main():
     args     = parser.parse_args()
     use_lora = args.lora_rank > 0
+    if use_lora and args.adapt_nets != 'both':
+        parser.error('--adapt-nets is a full-adaptation decomposition; '
+                     'it cannot be combined with --lora-rank > 0.')
 
     # ── Load pretrained models ────────────────────────────────────────────────
     pose_net, disp_net, weights_pose, weights_disp = init_models(args, device)
@@ -531,6 +558,14 @@ def main():
     elif args.part:
         freeze_except_decoder(pose_net)
         freeze_except_decoder(disp_net)
+
+    if not use_lora and args.adapt_nets != 'both':
+        frozen = disp_net if args.adapt_nets == 'pose' else pose_net
+        freeze_all(frozen)
+        n_train = sum(p.numel() for p in
+                      (pose_net if args.adapt_nets == 'pose' else disp_net).parameters())
+        print(f'Decomposition mode: full adaptation of {args.adapt_nets}_net only '
+              f'({n_train:,} params); the other net is frozen (grads off, BN pinned).')
 
     # ── Initialise "best weights" bookkeeping ─────────────────────────────────
     # These accumulate across the whole sequence: whenever a frame produces a
@@ -733,8 +768,10 @@ def main():
                     load_lora_state_dict(pose_net, weights_pose_best)
                     # disp_net: untouched (fully frozen, no state change)
                 else:
-                    pose_net.load_state_dict(weights_pose_best, strict=True)
-                    disp_net.load_state_dict(weights_disp_best, strict=True)
+                    if args.adapt_nets in ('both', 'pose'):
+                        pose_net.load_state_dict(weights_pose_best, strict=True)
+                    if args.adapt_nets in ('both', 'disp'):
+                        disp_net.load_state_dict(weights_disp_best, strict=True)
                     if args.part:
                         freeze_except_decoder(pose_net)
                         freeze_except_decoder(disp_net)

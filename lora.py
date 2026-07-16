@@ -25,9 +25,12 @@ class LoRALinear(nn.Module):
         self.lora_A = nn.Parameter(torch.empty(rank, in_f, device=dev, dtype=dt))
         self.lora_B = nn.Parameter(torch.zeros(out_f, rank, device=dev, dtype=dt))
         self.scale  = alpha / rank
+        self.enabled = True
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
     def forward(self, x):
+        if not self.enabled:
+            return self.original(x)
         return self.original(x) + self.scale * F.linear(F.linear(x, self.lora_A), self.lora_B)
 
 
@@ -50,6 +53,7 @@ class LoRAConv2d(nn.Module):
         self.lora_down = nn.Conv2d(in_ch, rank, kernel_size=1, bias=False)
         self.lora_up   = nn.Conv2d(rank, out_ch, kernel_size=1, bias=False)
         self.scale     = alpha / rank
+        self.enabled   = True
         nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_up.weight)
         # Match the wrapped layer's device/dtype (model may already be on GPU).
@@ -57,6 +61,8 @@ class LoRAConv2d(nn.Module):
         self.lora_up.to(original.weight.device, original.weight.dtype)
 
     def forward(self, x):
+        if not self.enabled:
+            return self.original(x)
         return self.original(x) + self.scale * self.lora_up(self.lora_down(x))
 
 
@@ -142,3 +148,28 @@ def load_lora_state_dict(model: nn.Module, sd: dict):
 
 def count_lora_params(model: nn.Module) -> int:
     return sum(p.numel() for p in lora_parameters(model))
+
+
+# ── Undoable adaptation ───────────────────────────────────────────────────────
+
+def set_lora_enabled(model: nn.Module, enabled: bool):
+    """Toggle every adapter path on/off. With enabled=False the model computes
+    exactly the pristine base network (adapters are additive), letting a probe
+    ask "is the WORLD still shifted?" independent of the adaptation state."""
+    for m in model.modules():
+        if isinstance(m, (LoRALinear, LoRAConv2d)):
+            m.enabled = enabled
+
+
+def reset_lora(model: nn.Module):
+    """Return the model to the exact pristine base network by re-applying the
+    init: up-projections to zero (adapter output becomes identically 0),
+    down-projections re-drawn. Exact by construction — the frozen weights were
+    never touched — which full-model online adaptation cannot offer."""
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            nn.init.kaiming_uniform_(m.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(m.lora_B)
+        elif isinstance(m, LoRAConv2d):
+            nn.init.kaiming_uniform_(m.lora_down.weight, a=math.sqrt(5))
+            nn.init.zeros_(m.lora_up.weight)

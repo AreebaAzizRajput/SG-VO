@@ -25,6 +25,7 @@ from inverse_warp import pose_vec2mat
 from lora import (
     inject_lora_pose_net, freeze_all,
     lora_parameters, lora_state_dict, load_lora_state_dict, count_lora_params,
+    set_lora_enabled, reset_lora,
 )
 
 parser = argparse.ArgumentParser(description='Inference with online adaptation',
@@ -136,6 +137,35 @@ parser.add_argument('--probe-signal', type=str, default='photo',
                          'motion the pose actually explains. bnstats: mean '
                          'BatchNorm feature-statistics distance from the '
                          'training domain — absolute, non-photometric.')
+parser.add_argument('--adapt-loss', type=str, default='photo',
+                    choices=['photo', 'norm'],
+                    help='Objective for the adaptation step. photo: raw '
+                         'photometric loss (legacy). norm: photometric loss '
+                         'divided by the zero-motion baseline of the frame — '
+                         'low contrast (fog) shrinks raw-loss gradients by the '
+                         'same transmission factor that confounds the probe, '
+                         'making adaptation sluggish exactly when it is '
+                         'needed; the division cancels that factor.')
+parser.add_argument('--reset-on-recovery', action='store_true',
+                    help='Undoable adaptation (LoRA + CUSUM only): while '
+                         'shifted, also probe with adapters DISABLED (the '
+                         'pristine base model — asks whether the WORLD is '
+                         'still shifted, so an adapter that has fit the fog '
+                         'cannot mask ongoing fog). When the base model '
+                         'matches or beats the adapted model for '
+                         '--recovery-patience consecutive frames — the '
+                         'adapters have stopped helping — reset the adapters '
+                         'to zero: the exact pre-adaptation model is '
+                         'recovered by construction.')
+parser.add_argument('--recovery-patience', type=int, default=30,
+                    help='Consecutive frames the base model must match/beat '
+                         'the adapted model before adapters are reset.')
+parser.add_argument('--recovery-margin', type=float, default=0.1,
+                    help='In units of the reference sigma: the adapter must '
+                         'beat the base model by MORE than this margin to '
+                         'count as still helping. Without it a dead-weight '
+                         'adapter that wins by numerical dust (measured: '
+                         '1e-5 on every frame) blocks the reset forever.')
 
 
 def load_tensor_image(filename, args):
@@ -221,7 +251,7 @@ def process_tail_poses(pose_net, test_files, start_idx,
 
 
 def train(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net, optimizer, epochs,
-          weights_disp_best, weights_pose_best, use_lora=False):
+          weights_disp_best, weights_pose_best, use_lora=False, photo_norm=None):
     global device
     batch_time = AverageMeter()
     data_time  = AverageMeter()
@@ -230,6 +260,21 @@ def train(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net, optimizer, ep
 
     disp_net.train()
     pose_net.train()
+
+    if use_lora:
+        # Confine adaptation strictly to the adapters. BatchNorm running
+        # stats are adapted state too: in train mode every adaptation step
+        # drifts them toward the current (e.g. fog) batch statistics — state
+        # that lives OUTSIDE the adapters, silently breaking reset_lora's
+        # exact-recovery guarantee (measured as a +0.03 probe elevation after
+        # reset) and the "only 0.083% of parameters adapt" accounting.
+        # Pin ONLY the BatchNorm modules: whole-net eval() would also switch
+        # DispResNet's forward to its eval shape (single tensor, not the
+        # multi-scale list) and crash the loss (see 8576494).
+        for net in (disp_net, pose_net):
+            for m in net.modules():
+                if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+                    m.eval()
 
     end        = time.time()
     best_error = -1
@@ -253,6 +298,14 @@ def train(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net, optimizer, ep
             args.with_mask, args.with_auto_mask, args.padding_mode)
 
         loss_2 = compute_smooth_loss(tgt_depth, tgt_img_forDepth, ref_depths, ref_imgs_forDepth)
+
+        if photo_norm is not None:
+            # --adapt-loss norm: fog scales the photometric term (and its
+            # gradients) down by the transmission factor; the zero-motion
+            # baseline carries the same factor, so this division restores
+            # contrast-invariant step sizes. The smooth/geometry terms are
+            # not contrast-scaled and keep their original weighting.
+            loss_1 = loss_1 / (photo_norm + 1e-12)
 
         loss = w1 * loss_1 + w2 * loss_2 + w3 * loss_3
         losses.update([loss, loss_1, loss_2, loss_3])
@@ -404,6 +457,24 @@ def probe_bnstats_distance(pose_net, tgt_img, ref_img) -> float:
     return float(np.mean(dists))
 
 
+def zero_motion_baseline(args, tgt_img, ref_imgs) -> float:
+    """Photometric cost of assuming no motion at all: the raw frame-to-frame
+    difference, averaged over the reference frames. Pure image arithmetic (no
+    network passes). Under the atmospheric scattering model both this baseline
+    and the warped photometric loss shrink by the same transmission factor, so
+    dividing by it makes the adaptation objective contrast-invariant."""
+    with torch.no_grad():
+        tgt = tgt_img[:, :3, :, :].to(device)
+        vals = []
+        for ref_full in ref_imgs:
+            ref  = ref_full[:, :3, :, :].to(device)
+            diff = (tgt - ref).abs().clamp(0, 1)
+            if args.with_ssim:
+                diff = 0.15 * diff + 0.85 * compute_ssim_loss(tgt, ref)
+            vals.append(diff.mean())
+        return float(torch.stack(vals).mean())
+
+
 def compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net) -> float:
     if args.probe_signal == 'ratio':
         return probe_ratio_loss(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
@@ -493,6 +564,11 @@ def main():
     cusum_sigma = args.cusum_ref_std
     cusum_calib = []    # losses collected during start-of-sequence calibration
 
+    # ── Recovery state (undoable adaptation) ──────────────────────────────────
+    shifted        = False   # a CUSUM fire has happened; adapters may be dirty
+    recovery_count = 0       # consecutive frames the BASE model was in-band
+    events         = []      # (frame, 'adapt'|'reset', signal) — saved at exit
+
     # ── Main inference loop ───────────────────────────────────────────────────
     for iter in tqdm(range(n - int(args.sequence_length) + 1)):
 
@@ -543,7 +619,9 @@ def main():
                 cusum_S = max(0.0, cusum_S + (current_loss - cusum_mu
                                               - args.cusum_kappa * cusum_sigma))
                 if cusum_S > args.cusum_h * cusum_sigma:
-                    cusum_S  = 0.0   # reset: adaptation happens this frame
+                    cusum_S = 0.0   # reset: adaptation happens this frame
+                    shifted = True
+                    events.append((iter, 'adapt', current_loss))
                 else:
                     do_adapt    = False
                     skip_count += 1
@@ -564,9 +642,42 @@ def main():
                 do_adapt    = False
                 skip_count += 1
 
+        # ── Recovery detection: undo the adaptation once the shift passes ─────
+        # While shifted, also probe with adapters DISABLED and compare: reset
+        # once the pristine base model matches/beats the adapted model for
+        # --recovery-patience consecutive frames, i.e. the adapters have
+        # stopped helping on the current world. Relative, so it needs no
+        # reference band and is immune to section difficulty (an absolute
+        # in-band test proved brittle: hard road sections sit at the band edge
+        # and break any consecutive count). Both probes see the same frames,
+        # so their fluctuations cancel in the comparison. Probing the adapted
+        # model alone would oscillate: adapt -> signal drops -> reset ->
+        # signal spikes -> adapt ...
+        if (args.reset_on_recovery and use_lora and shifted
+                and args.cusum_h > 0 and cusum_mu is not None):
+            set_lora_enabled(pose_net, False)
+            base_signal = compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
+            set_lora_enabled(pose_net, True)
+            # current_loss is the adapted-model probe. The adapter must beat
+            # the base by a significant margin to stay; ties and dust-level
+            # wins count toward the reset.
+            if base_signal <= current_loss + args.recovery_margin * cusum_sigma:
+                recovery_count += 1
+            else:
+                recovery_count = 0
+            if recovery_count >= args.recovery_patience:
+                reset_lora(pose_net)
+                weights_pose_best = lora_state_dict(pose_net)
+                optimizer = build_optimizer(args, pose_net, disp_net, use_lora=use_lora)
+                cusum_S, shifted, recovery_count = 0.0, False, 0
+                events.append((iter, 'reset', base_signal))
+                tqdm.write(f'[frame {iter}] shift over -> adapters reset to pristine base model')
+
         # ── Adaptation step (skipped on "easy" frames when trigger is active) ─
         if do_adapt:
             adapt_count += 1
+            photo_norm = (zero_motion_baseline(args, tgt_img, ref_imgs)
+                          if args.adapt_loss == 'norm' else None)
             errors, error_names, weights_disp_best, weights_pose_best = train(
                 args, tgt_img, ref_imgs,
                 intrinsics=intrinsics,
@@ -576,7 +687,8 @@ def main():
                 epochs=args.epochs,
                 weights_disp_best=weights_disp_best,
                 weights_pose_best=weights_pose_best,
-                use_lora=use_lora)
+                use_lora=use_lora,
+                photo_norm=photo_norm)
 
             if args.select_best:
                 if use_lora:
@@ -631,6 +743,13 @@ def main():
         loss_file = Path(args.output_dir + 'probe_losses_' + args.sequence + '.txt')
         np.savetxt(loss_file, np.asarray(probe_losses), fmt='%1.6e')
         print(f'Probe loss trace ({len(probe_losses)} frames) -> {loss_file}')
+
+    if events:
+        ev_file = Path(args.output_dir + 'trigger_events_' + args.sequence + '.txt')
+        with open(ev_file, 'w') as f:
+            for frame, kind, val in events:
+                f.write(f'{frame} {kind} {val:.6f}\n')
+        print(f'{len(events)} trigger events -> {ev_file}')
 
     poses    = np.concatenate(poses, axis=0)
     filename = Path(args.output_dir + args.sequence + ".txt")

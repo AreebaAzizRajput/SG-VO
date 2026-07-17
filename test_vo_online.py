@@ -23,7 +23,7 @@ from utils import (
 )
 from inverse_warp import pose_vec2mat
 from lora import (
-    inject_lora_pose_net, freeze_all,
+    inject_lora_pose_net, inject_lora_disp_net, freeze_all,
     lora_parameters, lora_state_dict, load_lora_state_dict, count_lora_params,
     set_lora_enabled, reset_lora,
 )
@@ -104,6 +104,16 @@ parser.add_argument('--lora-targets', type=str, default='attention',
 parser.add_argument('--lora-alpha', type=float, default=1.0,
                     help='LoRA scaling factor. Effective lr scale = lora_alpha / lora_rank. '
                          'Increasing alpha amplifies the adapter contribution.')
+parser.add_argument('--lora-nets', type=str, default='pose',
+                    choices=['pose', 'disp', 'both'],
+                    help='Which networks receive LoRA adapters. pose = original '
+                         'behaviour (--lora-targets applies). disp = depth decoder '
+                         'convs only — NOTE: trajectory is a pure function of '
+                         'pose_net, so disp-only adaptation cannot change the '
+                         'output (control condition). both = JOINT adaptation, '
+                         'the only PEFT configuration the network decomposition '
+                         'permits (pose-only gradients are poisoned by frozen '
+                         'shift-corrupted depth).')
 
 # ── Trigger arguments ─────────────────────────────────────────────────────────
 # What the trigger does: before every frame, do one cheap no-gradient forward
@@ -230,9 +240,9 @@ def init_models(args, device):
 
 def build_optimizer(args, pose_net, disp_net, use_lora=False):
     if use_lora:
-        # Only optimise LoRA adapter params in pose_net.
-        # disp_net is fully frozen when using LoRA, so we exclude it.
-        params = list(lora_parameters(pose_net))
+        # Only optimise LoRA adapter params. lora_parameters yields nothing
+        # for a net without adapters, so this is correct for pose/disp/both.
+        params = list(lora_parameters(pose_net)) + list(lora_parameters(disp_net))
         return torch.optim.Adam(params, lr=args.lr,
                                 betas=(args.momentum, args.beta),
                                 weight_decay=args.weight_decay)
@@ -349,9 +359,10 @@ def train(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net, optimizer, ep
 
         if is_best:
             if use_lora:
-                # LoRA: snapshot is tens of KB instead of ~150 MB
+                # LoRA: snapshots are tens of KB instead of ~150 MB
+                # (empty dict for a net without adapters)
                 weights_pose_best = lora_state_dict(pose_net)
-                # disp_net is fully frozen when using LoRA — its snapshot never changes
+                weights_disp_best = lora_state_dict(disp_net)
             else:
                 # A net frozen by --adapt-nets cannot change (grads off, BN
                 # pinned above) — skip its ~100 MB deepcopy.
@@ -538,22 +549,36 @@ def main():
     if use_lora:
         # Step 1: freeze everything in both networks
         freeze_all(pose_net)
-        freeze_all(disp_net)   # disp_net stays frozen throughout the whole sequence
+        freeze_all(disp_net)
 
-        # Step 2: inject low-rank adapters into the chosen modules of pose_net.
-        # This un-freezes only the newly added LoRA parameters (lora_A, lora_B,
-        # lora_down, lora_up) while keeping the original weights frozen.
-        inject_lora_pose_net(pose_net,
-                             rank=args.lora_rank,
-                             alpha=args.lora_alpha,
-                             targets=args.lora_targets)
+        # Step 2: inject low-rank adapters. Only the newly added LoRA params
+        # (lora_A/lora_B, lora_down/lora_up) are trainable; base weights stay
+        # frozen. Decomposition finding (2026-07-17): pose-only adaptation is
+        # directionally wrong (gradients poisoned by frozen shift-corrupted
+        # depth) and disp-only cannot move the trajectory at all — 'both' is
+        # the configuration the mechanism permits.
+        if args.lora_nets in ('pose', 'both'):
+            inject_lora_pose_net(pose_net,
+                                 rank=args.lora_rank,
+                                 alpha=args.lora_alpha,
+                                 targets=args.lora_targets)
+        n_disp_convs = 0
+        if args.lora_nets in ('disp', 'both'):
+            n_disp_convs = inject_lora_disp_net(disp_net,
+                                                rank=args.lora_rank,
+                                                alpha=args.lora_alpha)
+        if args.lora_nets == 'disp':
+            print('WARNING: --lora-nets disp is a control condition — the '
+                  'trajectory is a pure function of pose_net and cannot change.')
 
-        n_lora  = count_lora_params(pose_net)
-        n_total = sum(p.numel() for p in pose_net.parameters())
-        print(f'LoRA enabled  |  targets={args.lora_targets}  rank={args.lora_rank}  '
-              f'alpha={args.lora_alpha}')
+        n_lora  = count_lora_params(pose_net) + count_lora_params(disp_net)
+        n_total = (sum(p.numel() for p in pose_net.parameters())
+                   + sum(p.numel() for p in disp_net.parameters()))
+        print(f'LoRA enabled  |  nets={args.lora_nets}  targets={args.lora_targets}  '
+              f'rank={args.lora_rank}  alpha={args.lora_alpha}'
+              + (f'  disp_decoder_convs={n_disp_convs}' if n_disp_convs else ''))
         print(f'Trainable params: {n_lora:,} / {n_total:,} '
-              f'({100 * n_lora / n_total:.3f}% of pose_net)')
+              f'({100 * n_lora / n_total:.3f}% of both nets)')
 
     elif args.part:
         freeze_except_decoder(pose_net)
@@ -570,13 +595,16 @@ def main():
     # ── Initialise "best weights" bookkeeping ─────────────────────────────────
     # These accumulate across the whole sequence: whenever a frame produces a
     # lower photo loss than any previous frame, the current weights are saved.
-    weights_disp_best = weights_disp['state_dict']
     if use_lora:
         # LoRA adapters start at zero correction (B=0), so the initial snapshot
-        # is just the zero-adapter state.
+        # is just the zero-adapter state. lora_state_dict returns {} for a net
+        # without adapters, and load_lora_state_dict no-ops on it — so this is
+        # correct for --lora-nets pose/disp/both alike.
         weights_pose_best = lora_state_dict(pose_net)
+        weights_disp_best = lora_state_dict(disp_net)
     else:
         weights_pose_best = weights_pose['state_dict']
+        weights_disp_best = weights_disp['state_dict']
 
     print('=> setting adam solver')
     optimizer = build_optimizer(args, pose_net, disp_net, use_lora=use_lora)
@@ -727,8 +755,10 @@ def main():
         if (args.reset_on_recovery and use_lora and shifted and not static_frame
                 and args.cusum_h > 0 and cusum_mu is not None):
             set_lora_enabled(pose_net, False)
+            set_lora_enabled(disp_net, False)
             base_signal, _ = compute_probe_signal(args, tgt_img, ref_imgs, intrinsics, disp_net, pose_net)
             set_lora_enabled(pose_net, True)
+            set_lora_enabled(disp_net, True)
             # current_loss is the adapted-model probe. The adapter must beat
             # the base by a significant margin to stay; ties and dust-level
             # wins count toward the reset.
@@ -738,7 +768,9 @@ def main():
                 recovery_count = 0
             if recovery_count >= args.recovery_patience:
                 reset_lora(pose_net)
+                reset_lora(disp_net)
                 weights_pose_best = lora_state_dict(pose_net)
+                weights_disp_best = lora_state_dict(disp_net)
                 optimizer = build_optimizer(args, pose_net, disp_net, use_lora=use_lora)
                 cusum_S, shifted, recovery_count = 0.0, False, 0
                 events.append((iter, 'reset', base_signal))
@@ -763,10 +795,10 @@ def main():
 
             if args.select_best:
                 if use_lora:
-                    # Restore pose_net's LoRA adapters to the best snapshot.
+                    # Restore LoRA adapters to the best snapshot.
                     # Cost: copy tens of KB — not ~150 MB.
                     load_lora_state_dict(pose_net, weights_pose_best)
-                    # disp_net: untouched (fully frozen, no state change)
+                    load_lora_state_dict(disp_net, weights_disp_best)
                 else:
                     if args.adapt_nets in ('both', 'pose'):
                         pose_net.load_state_dict(weights_pose_best, strict=True)

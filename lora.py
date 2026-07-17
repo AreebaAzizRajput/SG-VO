@@ -45,6 +45,7 @@ class LoRAConv2d(nn.Module):
 
     def __init__(self, original: nn.Conv2d, rank: int = 8, alpha: float = 1.0):
         super().__init__()
+        assert original.stride == (1, 1), 'LoRAConv2d assumes stride 1'
         self.original = original
         for p in self.original.parameters():
             p.requires_grad_(False)
@@ -54,6 +55,15 @@ class LoRAConv2d(nn.Module):
         self.lora_up   = nn.Conv2d(rank, out_ch, kernel_size=1, bias=False)
         self.scale     = alpha / rank
         self.enabled   = True
+        # Spatial alignment: with stride 1 the original outputs
+        # H + 2p - (k-1); the 1×1 path outputs H. When the conv is fed
+        # pre-padded input (e.g. DispResNet's Conv3x3: ReflectionPad2d(1)
+        # then Conv2d(3, padding=0)), the adapter output must be
+        # center-cropped by (k-1)/2 - p per side. Cropping a 1×1 conv's
+        # output is exact: it equals applying the adapter to the un-padded
+        # input region. Zero for the pose-net targets (k=1 p=0 / k=3 p=1).
+        self.crop_h = (original.kernel_size[0] - 1) // 2 - original.padding[0]
+        self.crop_w = (original.kernel_size[1] - 1) // 2 - original.padding[1]
         nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_up.weight)
         # Match the wrapped layer's device/dtype (model may already be on GPU).
@@ -63,7 +73,12 @@ class LoRAConv2d(nn.Module):
     def forward(self, x):
         if not self.enabled:
             return self.original(x)
-        return self.original(x) + self.scale * self.lora_up(self.lora_down(x))
+        lora = self.lora_up(self.lora_down(x))
+        if self.crop_h or self.crop_w:
+            lora = lora[:, :,
+                        self.crop_h: lora.shape[2] - self.crop_h,
+                        self.crop_w: lora.shape[3] - self.crop_w]
+        return self.original(x) + self.scale * lora
 
 
 # ── Freezing ──────────────────────────────────────────────────────────────────
@@ -101,6 +116,30 @@ def inject_lora_pose_net(pose_net: nn.Module, rank: int = 8, alpha: float = 1.0,
         net = pose_net.decoder.net
         for i in range(len(net)):
             net[i] = LoRAConv2d(net[i], rank=rank, alpha=alpha)
+
+
+def inject_lora_disp_net(disp_net: nn.Module, rank: int = 8, alpha: float = 1.0) -> int:
+    """Inject LoRA into every decoder conv of DispResNet (upconvs + dispconvs).
+
+    Why the decoder: the network-decomposition experiment (2026-07-17) showed
+    the fog rescue is irreducibly JOINT — pose-only adaptation gets poisoned
+    gradients through fog-corrupted frozen depth. Depth adapters exist to keep
+    the photometric loss landscape honest while the pose adapters move.
+
+    Wiring subtlety: DepthDecoder.forward dispatches through the `convs`
+    OrderedDict while parameters register through the `decoder` ModuleList —
+    the SAME module objects under two references. Wrapping the nn.Conv2d
+    INSIDE each Conv3x3 mutates the shared object, so both references see the
+    adapter; replacing ModuleList slots would leave forward() on the originals.
+
+    The encoder is left untouched (candidate for a later ablation rung).
+    Call freeze_all(disp_net) BEFORE this. Returns the number of wrapped convs.
+    """
+    targets = [m for m in disp_net.decoder.modules()
+               if type(m).__name__ == 'Conv3x3' and isinstance(m.conv, nn.Conv2d)]
+    for m in targets:
+        m.conv = LoRAConv2d(m.conv, rank=rank, alpha=alpha)
+    return len(targets)
 
 
 # ── Parameter and state helpers ───────────────────────────────────────────────
